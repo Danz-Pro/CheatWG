@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CheatWG
 // @namespace    https://github.com/Danz-Pro/CheatWG
-// @version      1.0
-// @description  Wayground Join Code Game Helper — Sacrifice & Cache strategy
+// @version      3.0
+// @description  Wayground Join Code Game Helper — Proceed API Strategy
 // @author       Danz-Pro
 // @match        https://wayground.com/*
 // @match        https://quizizz.com/*
@@ -14,6 +14,7 @@
   // Load the bundle
   const script = document.createElement('script');
   script.src = 'https://cdn.jsdelivr.net/gh/Danz-Pro/CheatWG@main/dist/bundle.js';
-  script.onload = () => console.log('[CheatWG] Script loaded');
+  script.onload = () => console.log('[CheatWG] v3.0 Script loaded');
+  script.onerror = () => console.error('[CheatWG] Failed to load script');
   document.head.appendChild(script);
 })();

@@ -1,6 +1,6 @@
 /*
 ════════════════════════════════════════════════════════════════════
-  CheatWG v2.0 — Wayground Join Code Game Helper
+  CheatWG v3.0 — Wayground Join Code Game Helper
   https://github.com/Danz-Pro/CheatWG
 
   DEEP ANALYSIS FINDINGS (Join Code Mode):
@@ -8,27 +8,26 @@
   │ ★ KEY DISCOVERY: Proceed API leaks correct answers! ★      │
   │                                                             │
   │ POST /_gameapi/main/public/v1/games/{roomHash}/proceed     │
-  │ → Response contains: data.question.structure.answer        │
+  │ → Response: data.question.structure.answer                 │
   │ → Returns correct answer index BEFORE user answers!        │
   │                                                             │
-  │ Other findings:                                             │
-  │ 1. quizId is UNDEFINED in gameData for join code mode      │
-  │ 2. Quiz API /_api/main/quiz/{id} — DOES NOT WORK          │
-  │ 3. Game API /_api/main/game/{hash} — AUTH REQUIRED         │
-  │ 4. Pinia answers: answer = -1 / [] for active questions    │
-  │ 5. After answering: answer reveals correct index           │
-  │ 6. data-cy="option-N" uses ORIGINAL API index              │
-  │ 7. jumbleAnswers = true — display shuffled                 │
-  │ 8. Proceed API body needs: roomHash, playerId, response,  │
-  │    questionId, powerupEffects, quizVersionId, elapsed      │
-  │ 9. Proceed pre-fetch makes question "attempted" on server  │
-  │    but UI can still answer — result follows first attempt  │
+  │ STRATEGY: "Proceed & Highlight"                            │
+  │ → For each current question, call Proceed API with         │
+  │   a dummy answer to extract the correct answer             │
+  │ → Highlight correct option using data-cy attribute         │
+  │ → Cache answers for replay                                 │
+  │ → Auto-advance handled by game flow                        │
   │                                                             │
-  │ STRATEGY: "Pre-Fetch All via Proceed API"                  │
-  │ → On game start, fetch ALL answers via proceed API         │
-  │ → Cache answers for instant highlight                      │
-  │ → Highlight correct option BEFORE user clicks              │
-  │ → Cache to localStorage for next session                   │
+  │ Verified facts:                                             │
+  │ • quizId = undefined in join mode                          │
+  │ • Quiz API unusable, Game API needs auth                   │
+  │ • answer = -1 in Pinia before answering                    │
+  │ • data-cy="option-N" uses ORIGINAL API index               │
+  │ • jumbleAnswers = true, options shuffled on display        │
+  │ • redemption = "yes", second attempts allowed              │
+  │ • antiCheating.enabled = true (no actual blocking)         │
+  │ • roomHash = MongoDB ID, not encrypted URL hash            │
+  │ • 15 questions total: MCQ, MSQ, BLANK types                │
   └─────────────────────────────────────────────────────────────┘
 ════════════════════════════════════════════════════════════════════
 */
@@ -44,6 +43,7 @@ interface CachedAnswer {
   displayTexts: string[];
   blankTexts: string[];
   imageUrls: string[];
+  fetched: boolean;
 }
 
 // ═══════════════════════════════════════════
@@ -77,29 +77,25 @@ const T = {
 //  STATE
 // ═══════════════════════════════════════════
 
-const STATE = {
+const S = {
   answers: new Map<string, CachedAnswer>(),
-  currentQId: "" as string,
+  currentQId: "",
   pollTimer: null as ReturnType<typeof setInterval> | null,
   panel: null as HTMLElement | null,
   style: null as HTMLElement | null,
   inGame: false,
   totalQ: 0,
-  answeredQ: 0,
-  correctQ: 0,
   dimWrong: true,
   debug: false,
   dragging: false,
   dragOffset: { x: 0, y: 0 },
-  lastHighlightQId: "" as string,
-  retryCount: 0,
-  maxRetries: 15,
-  roomHash: "" as string,
-  roomCode: "" as string,
-  playerId: "" as string,
-  quizVersionId: "" as string,
-  prefetched: false,
-  fetchingInProgress: false,
+  lastHighlightQId: "",
+  roomHash: "",
+  roomCode: "",
+  playerId: "",
+  quizVersionId: "",
+  fetchingQId: "",
+  initialized: false,
 };
 
 // ═══════════════════════════════════════════
@@ -107,7 +103,7 @@ const STATE = {
 // ═══════════════════════════════════════════
 
 const LOG = {
-  info: (m: string) => STATE.debug && console.log(`%c[CheatWG]%c ${m}`, "color:#7c4dff;font-weight:bold", "color:inherit"),
+  info: (m: string) => S.debug && console.log(`%c[CheatWG]%c ${m}`, "color:#7c4dff;font-weight:bold", "color:inherit"),
   warn: (m: string) => console.warn(`%c[CheatWG]%c ${m}`, "color:#ffd54f;font-weight:bold", "color:inherit"),
   error: (m: string) => console.error(`%c[CheatWG]%c ${m}`, "color:#ff5252;font-weight:bold", "color:inherit"),
   success: (m: string) => console.log(`%c[CheatWG]%c ${m}`, "color:#00e676;font-weight:bold", "color:inherit"),
@@ -119,31 +115,35 @@ const LOG = {
 // ═══════════════════════════════════════════
 
 const Pinia = {
-  get(): any {
-    const root = document.querySelector("#root") || document.querySelector("#app");
-    if (!root) return null;
-    const app = (root as any).__vue_app__;
-    if (!app) return null;
-    return app.config.globalProperties?.$pinia || null;
+  _get(): any {
+    try {
+      const root = document.querySelector("#root") || document.querySelector("#app");
+      if (!root) return null;
+      const app = (root as any).__vue_app__;
+      if (!app) return null;
+      return app.config.globalProperties?.$pinia || null;
+    } catch { return null; }
   },
 
   store(name: string): any {
-    const p = this.get();
-    return p?._s.get(name) || null;
+    const p = this._get();
+    return p?._s?.get(name) || null;
   },
 
   state(name: string): any {
-    return this.store(name)?.$state || null;
+    const store = this.store(name);
+    return store?.$state || null;
   },
 
-  get roomHash(): string | null { return this.state("gameData")?.roomHash || null; },
-  get roomCode(): string | null { return this.state("gameData")?.roomCode || null; },
-  get gameState(): string | null { return this.state("gameData")?.gameState || null; },
-  get quizVersionId(): string | null { return this.state("gameData")?.quizVersionId || null; },
+  get roomHash(): string { return this.state("gameData")?.roomHash || ""; },
+  get roomCode(): string { return this.state("gameData")?.roomCode || ""; },
+  get gameState(): string { return this.state("gameData")?.gameState || ""; },
+  get quizVersionId(): string { return this.state("gameData")?.quizVersionId || ""; },
+  get totalQuestions(): number { return this.state("gameData")?.totalQuestionsInQuiz || 0; },
 
-  get currentQId(): string | null {
+  get currentQId(): string {
     const gq = this.state("gameQuestions");
-    return gq?.currentId || gq?.currentQuestionId || null;
+    return gq?.currentId || gq?.currentQuestionId || "";
   },
 
   get inGame(): boolean {
@@ -160,15 +160,15 @@ const Pinia = {
   getText(qId: string): string { return this.getQuestion(qId)?.text || ""; },
   getOptions(qId: string): any[] { return this.getQuestion(qId)?.options || []; },
   getAnswer(qId: string): any { return this.getQuestion(qId)?.answer; },
-  getState(qId: string): string { return this.getQuestion(qId)?.state || "unknown"; },
+  getState(qId: string): string { return this.getQuestion(qId)?.state || ""; },
 
   get playerId(): string {
     const p = this.state("player");
     return p?.playerId || "";
   },
 
-  get totalQuestions(): number {
-    return this.state("gameData")?.totalQuestionsInQuiz || this.questionIds.length;
+  get gameOptions(): any {
+    return this.state("gameData")?.gameOptions || {};
   },
 };
 
@@ -188,14 +188,14 @@ const stripHtml = (html: string): string => {
 // ═══════════════════════════════════════════
 
 const AnswerCache = {
-  KEY: "cheatwg_v2",
+  KEY: "cheatwg_v3",
 
   save(roomHash: string): void {
     const data: Record<string, any> = {};
-    STATE.answers.forEach((val, key) => { data[key] = val; });
+    S.answers.forEach((val, key) => { data[key] = val; });
     try {
       localStorage.setItem(`${this.KEY}_${roomHash}`, JSON.stringify(data));
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   },
 
   load(roomHash: string): number {
@@ -205,11 +205,11 @@ const AnswerCache = {
       const data = JSON.parse(raw);
       let count = 0;
       for (const [qId, ans] of Object.entries(data)) {
-        STATE.answers.set(qId, ans as CachedAnswer);
+        S.answers.set(qId, ans as CachedAnswer);
         count++;
       }
       return count;
-    } catch (e) { return 0; }
+    } catch { return 0; }
   },
 };
 
@@ -219,23 +219,23 @@ const AnswerCache = {
 
 const ProceedAPI = {
   /**
-   * Fetch correct answer for a question via Proceed API.
-   * KEY DISCOVERY: Proceed API response contains data.question.structure.answer
-   * which reveals the correct answer index!
+   * Build the Proceed API request body for a question.
    */
-  async fetchAnswer(questionId: string, questionType: string): Promise<number | number[] | null> {
-    if (STATE.fetchingInProgress) return null;
+  buildBody(questionId: string, questionType: string): any {
+    let response: any = 0;
+    if (questionType === "MSQ") response = [0];
+    else if (questionType === "BLANK" || questionType === "OPEN") response = "";
 
-    const body = {
-      roomHash: Pinia.roomHash || STATE.roomHash,
-      playerId: Pinia.playerId || STATE.playerId,
+    return {
+      roomHash: S.roomHash,
+      playerId: S.playerId,
       response: {
         attempt: 0,
         questionId: questionId,
         questionType: questionType,
-        response: questionType === "MSQ" ? [0] : questionType === "BLANK" || questionType === "OPEN" ? "" : 0,
+        response: response,
         responseType: "original",
-        timeTaken: 1000 + Math.floor(Math.random() * 5000),
+        timeTaken: 2000 + Math.floor(Math.random() * 4000),
         answer: [],
         isEvaluated: false,
         state: "attempted",
@@ -250,14 +250,27 @@ const ProceedAPI = {
       },
       questionId: questionId,
       powerupEffects: { destroy: [] },
-      quizVersionId: Pinia.quizVersionId || STATE.quizVersionId,
+      quizVersionId: S.quizVersionId,
       elapsed: 0,
       isLastPlayerResponse: false,
     };
+  },
+
+  /**
+   * Fetch correct answer for a single question via Proceed API.
+   * Returns the correct answer index/indices from data.question.structure.answer.
+   */
+  async fetchAnswer(questionId: string): Promise<number | number[] | null> {
+    // Prevent duplicate fetches
+    if (S.fetchingQId === questionId) return null;
+    S.fetchingQId = questionId;
+
+    const qType = Pinia.getType(questionId);
+    const body = this.buildBody(questionId, qType);
 
     try {
       const r = await fetch(
-        `/_gameapi/main/public/v1/games/${STATE.roomHash}/proceed`,
+        `/_gameapi/main/public/v1/games/${S.roomHash}/proceed`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -282,124 +295,105 @@ const ProceedAPI = {
         return answer;
       }
 
+      LOG.warn(`Proceed API: no answer in response for ${questionId}`);
       return null;
     } catch (e: any) {
-      LOG.warn(`Proceed API error: ${e.message}`);
+      LOG.error(`Proceed API error: ${e.message}`);
       return null;
+    } finally {
+      S.fetchingQId = "";
     }
   },
 
   /**
-   * Pre-fetch ALL answers at once via Proceed API.
-   * Sequential with delay to avoid rate limiting.
+   * Process the answer from Proceed API and cache it.
    */
-  async prefetchAllAnswers(): Promise<number> {
-    if (STATE.prefetched || STATE.fetchingInProgress) return 0;
-    STATE.fetchingInProgress = true;
+  processAnswer(questionId: string, answer: number | number[] | null): CachedAnswer | null {
+    if (answer === null) return null;
 
-    const qIds = Pinia.questionIds;
-    let fetched = 0;
+    const qType = Pinia.getType(questionId);
+    const options = Pinia.getOptions(questionId);
 
-    LOG.always(`Pre-fetching answers for ${qIds.length} questions...`);
-    Panel.updateStatus(`Mengambil ${qIds.length} jawaban...`, "loading");
+    const cached: CachedAnswer = {
+      questionId,
+      type: qType,
+      correctIndices: [],
+      displayTexts: [],
+      blankTexts: [],
+      imageUrls: [],
+      fetched: true,
+    };
 
-    for (let i = 0; i < qIds.length; i++) {
-      const qId = qIds[i];
-
-      // Skip if already cached
-      if (STATE.answers.has(qId) && STATE.answers.get(qId)!.correctIndices.length > 0) {
-        fetched++;
-        continue;
+    if (qType === "MCQ" || qType === "MSQ" || qType === "IS" || qType === "ORDER") {
+      // Parse answer indices
+      if (typeof answer === "number" && answer >= 0) {
+        cached.correctIndices.push(answer);
+      } else if (Array.isArray(answer)) {
+        answer.forEach((idx: number) => {
+          if (typeof idx === "number" && idx >= 0) cached.correctIndices.push(idx);
+        });
       }
 
-      // Skip if already revealed in Pinia
-      const piniaAnswer = Pinia.getAnswer(qId);
-      const qType = Pinia.getType(qId);
-      const isRevealed = (qType === "MCQ" || qType === "MSQ" || qType === "IS" || qType === "ORDER")
-        ? (typeof piniaAnswer === "number" && piniaAnswer >= 0) || (Array.isArray(piniaAnswer) && piniaAnswer.length > 0 && typeof piniaAnswer[0] === "number" && piniaAnswer[0] >= 0)
-        : (qType === "BLANK" || qType === "OPEN") && Array.isArray(piniaAnswer) && piniaAnswer.length > 0;
-
-      if (isRevealed) {
-        this.captureFromPinia(qId);
-        fetched++;
-        continue;
-      }
-
-      // Fetch from Proceed API
-      const answer = await this.fetchAnswer(qId, qType);
-
-      if (answer !== null) {
-        const options = Pinia.getOptions(qId);
-        const cached: CachedAnswer = {
-          questionId: qId,
-          type: qType,
-          correctIndices: [],
-          displayTexts: [],
-          blankTexts: [],
-          imageUrls: [],
-        };
-
-        // Parse answer
-        if (qType === "MCQ" || qType === "MSQ" || qType === "IS" || qType === "ORDER") {
-          if (typeof answer === "number" && answer >= 0) {
-            cached.correctIndices.push(answer);
-          } else if (Array.isArray(answer)) {
-            answer.forEach((idx: number) => {
-              if (typeof idx === "number" && idx >= 0) cached.correctIndices.push(idx);
-            });
-          }
-
-          // Build display texts
-          cached.correctIndices.forEach((idx) => {
-            if (idx < options.length) {
-              const opt = options[idx];
-              const rawText = stripHtml(opt.text || "");
-              if (rawText) cached.displayTexts.push(rawText);
-              if (opt.media?.[0]?.url) cached.imageUrls.push(opt.media[0].url.split("?")[0]);
-            }
+      // Build display texts from options using API indices
+      cached.correctIndices.forEach((idx) => {
+        if (idx < options.length) {
+          const opt = options[idx];
+          const rawText = stripHtml(opt.text || "");
+          if (rawText) cached.displayTexts.push(rawText);
+          if (opt.media?.[0]?.url) cached.imageUrls.push(opt.media[0].url.split("?")[0]);
+        }
+      });
+    } else if (qType === "BLANK" || qType === "OPEN") {
+      if (Array.isArray(answer) && answer.length > 0) {
+        if (typeof answer[0] === "object") {
+          // BLANK type: answer is array of {targetId, optionId[]}
+          const optMap = new Map<string, string>();
+          options.forEach((o: any) => {
+            if (o.id || o._id) optMap.set(o.id || o._id, stripHtml(o.text));
           });
-        } else if (qType === "BLANK" || qType === "OPEN") {
-          if (Array.isArray(answer) && answer.length > 0 && typeof answer[0] === "object") {
-            const optMap = new Map<string, string>();
-            options.forEach((o: any) => { if (o.id || o._id) optMap.set(o.id || o._id, stripHtml(o.text)); });
-            (answer as unknown as Array<{targetId: string; optionId: string[]}>).forEach((a) => {
-              a.optionId?.forEach((oid) => {
-                const txt = optMap.get(oid);
-                if (txt) { cached.blankTexts.push(txt); cached.displayTexts.push(txt); }
-              });
-            });
-          }
-          if (cached.blankTexts.length === 0) {
-            options.forEach((o: any) => {
-              const txt = stripHtml(o.text || "");
+          (answer as unknown as Array<{targetId: string; optionId: string[]}>).forEach((a) => {
+            a.optionId?.forEach((oid) => {
+              const txt = optMap.get(oid);
               if (txt) { cached.blankTexts.push(txt); cached.displayTexts.push(txt); }
             });
-          }
+          });
+        } else {
+          // OPEN type: answer might be array of strings
+          answer.forEach((a: any) => {
+            if (typeof a === "string" && a) { cached.blankTexts.push(a); cached.displayTexts.push(a); }
+          });
         }
-
-        STATE.answers.set(qId, cached);
-        fetched++;
       }
-
-      // Small delay between requests
-      await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
-
-      // Update panel progress
-      Panel.updateStatus(`Mengambil jawaban... ${i + 1}/${qIds.length}`, "loading");
+      // Fallback: if no blank texts found, extract from options
+      if (cached.blankTexts.length === 0) {
+        options.forEach((o: any) => {
+          const txt = stripHtml(o.text || "");
+          if (txt) { cached.blankTexts.push(txt); cached.displayTexts.push(txt); }
+        });
+      }
     }
 
-    STATE.prefetched = true;
-    STATE.fetchingInProgress = false;
-
-    if (STATE.roomHash) AnswerCache.save(STATE.roomHash);
-
-    LOG.success(`Pre-fetch complete: ${fetched}/${qIds.length} answers fetched`);
-    return fetched;
+    S.answers.set(questionId, cached);
+    return cached;
   },
 
-  /** Capture revealed answer from Pinia store */
+  /**
+   * Fetch answer for current question and process it.
+   */
+  async fetchAndProcess(questionId: string): Promise<CachedAnswer | null> {
+    // Check if already cached
+    const existing = S.answers.get(questionId);
+    if (existing && existing.fetched && existing.correctIndices.length > 0) return existing;
+
+    const answer = await this.fetchAnswer(questionId);
+    return this.processAnswer(questionId, answer);
+  },
+
+  /**
+   * Capture revealed answer from Pinia store (after user answers).
+   */
   captureFromPinia(qId: string): void {
-    if (STATE.answers.has(qId) && STATE.answers.get(qId)!.correctIndices.length > 0) return;
+    if (S.answers.has(qId) && S.answers.get(qId)!.fetched) return;
 
     const answerVal = Pinia.getAnswer(qId);
     const type = Pinia.getType(qId);
@@ -412,7 +406,7 @@ const ProceedAPI = {
     if (!isRevealed) return;
 
     const cached: CachedAnswer = {
-      questionId: qId, type, correctIndices: [], displayTexts: [], blankTexts: [], imageUrls: [],
+      questionId: qId, type, correctIndices: [], displayTexts: [], blankTexts: [], imageUrls: [], fetched: true,
     };
 
     if (type === "MCQ" || type === "MSQ" || type === "IS" || type === "ORDER") {
@@ -446,19 +440,7 @@ const ProceedAPI = {
       }
     }
 
-    STATE.answers.set(qId, cached);
-  },
-
-  /** Capture all revealed answers from Pinia */
-  captureAllRevealed(): number {
-    let count = 0;
-    for (const qId of Pinia.questionIds) {
-      const prev = STATE.answers.get(qId);
-      if (prev && prev.correctIndices.length > 0) continue;
-      this.captureFromPinia(qId);
-      if (STATE.answers.get(qId) && STATE.answers.get(qId)!.correctIndices.length > 0) count++;
-    }
-    return count;
+    S.answers.set(qId, cached);
   },
 };
 
@@ -467,11 +449,23 @@ const ProceedAPI = {
 // ═══════════════════════════════════════════
 
 const DOM = {
-  getOptions(): HTMLElement[] { return Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')); },
-  getOptionByIndex(idx: number): HTMLElement | null { return document.querySelector<HTMLElement>(`[data-cy="option-${idx}"]`); },
-  getBlankInput(): HTMLInputElement | null { return document.querySelector<HTMLInputElement>('[data-cy="fib-text-input"]') || document.querySelector<HTMLInputElement>('input.fib-text-input'); },
-  getSubmitButton(): HTMLElement | null { return document.querySelector<HTMLElement>('[data-cy="submit-button"]') || document.querySelector<HTMLElement>('button[type="submit"]'); },
+  /** Get all option elements with role="option" */
+  getOptions(): HTMLElement[] {
+    return Array.from(document.querySelectorAll<HTMLElement>('[role="option"]'));
+  },
 
+  /** Get option by API index using data-cy attribute */
+  getOptionByIndex(idx: number): HTMLElement | null {
+    return document.querySelector<HTMLElement>(`[data-cy="option-${idx}"]`);
+  },
+
+  /** Get blank/FIB input */
+  getBlankInput(): HTMLInputElement | null {
+    return document.querySelector<HTMLInputElement>('[data-cy="fib-text-input"]')
+      || document.querySelector<HTMLInputElement>('input.fib-text-input');
+  },
+
+  /** Clear all highlights */
   clearHighlights(): void {
     document.querySelectorAll<HTMLElement>("[data-wg-correct], [data-wg-wrong]").forEach((el) => {
       el.style.outline = "";
@@ -486,6 +480,7 @@ const DOM = {
     });
   },
 
+  /** Highlight correct option with gold glow */
   highlightCorrect(el: HTMLElement): void {
     el.style.outline = `2px solid ${T.gold}`;
     el.style.outlineOffset = "1px";
@@ -496,12 +491,14 @@ const DOM = {
     el.setAttribute("data-wg-correct", "1");
   },
 
-  dimWrong(el: HTMLElement): void {
+  /** Dim wrong options */
+  dimWrongOption(el: HTMLElement): void {
     el.style.opacity = T.dimOpacity;
     el.style.transition = "opacity 0.4s ease";
     el.setAttribute("data-wg-wrong", "1");
   },
 
+  /** Extract background image URL from element */
   extractImageUrl(el: HTMLElement): string | null {
     const els = [el, ...Array.from(el.querySelectorAll<HTMLElement>("div"))];
     for (const e of els) {
@@ -514,6 +511,7 @@ const DOM = {
     return null;
   },
 
+  /** Fill blank input with text */
   fillBlank(text: string): boolean {
     const input = this.getBlankInput();
     if (!input) return false;
@@ -535,6 +533,7 @@ const Engine = {
     const allOptions = DOM.getOptions();
     if (allOptions.length === 0 && cached.type !== "BLANK" && cached.type !== "OPEN") return false;
 
+    // Handle BLANK/OPEN type
     if (cached.type === "BLANK" || cached.type === "OPEN") {
       if (cached.blankTexts.length > 0) {
         DOM.fillBlank(cached.blankTexts[0]);
@@ -542,21 +541,25 @@ const Engine = {
       return true;
     }
 
-    // METHOD 1: data-cy="option-N" — BULLETPROOF
+    // METHOD 1: data-cy="option-N" — PRIMARY & BULLETPROOF
     const correctEls: HTMLElement[] = [];
     for (const idx of cached.correctIndices) {
       const el = DOM.getOptionByIndex(idx);
-      if (el) correctEls.push(el);
+      if (el) {
+        correctEls.push(el);
+        LOG.info(`Found option-${idx} via data-cy`);
+      }
     }
 
-    // METHOD 2: Text fallback
+    // METHOD 2: Text matching fallback
     if (correctEls.length === 0 && cached.displayTexts.length > 0) {
       allOptions.forEach((el) => {
         const elText = stripHtml(el.textContent || "").toLowerCase();
         for (const ct of cached.displayTexts) {
           const ctLower = ct.toLowerCase();
           if (elText === ctLower || elText.includes(ctLower) || ctLower.includes(elText)) {
-            correctEls.push(el); break;
+            correctEls.push(el);
+            break;
           }
         }
       });
@@ -568,19 +571,11 @@ const Engine = {
         const url = DOM.extractImageUrl(el);
         if (url) {
           for (const cu of cached.imageUrls) {
-            if (url === cu || url.includes(cu) || cu.includes(url)) { correctEls.push(el); break; }
+            if (url === cu || url.includes(cu) || cu.includes(url)) {
+              correctEls.push(el);
+              break;
+            }
           }
-        }
-      });
-    }
-
-    // METHOD 4: Numeric comparison
-    if (correctEls.length === 0 && cached.displayTexts.length > 0) {
-      allOptions.forEach((el) => {
-        const elNum = parseFloat(stripHtml(el.textContent || "").replace(/[^\d.\-]/g, ""));
-        for (const ct of cached.displayTexts) {
-          const ctNum = parseFloat(ct.replace(/[^\d.\-]/g, ""));
-          if (!isNaN(elNum) && !isNaN(ctNum) && Math.abs(elNum - ctNum) < 0.01) { correctEls.push(el); break; }
         }
       });
     }
@@ -590,7 +585,7 @@ const Engine = {
       const correctSet = new Set(correctEls);
       allOptions.forEach((el) => {
         if (correctSet.has(el)) DOM.highlightCorrect(el);
-        else if (STATE.dimWrong) DOM.dimWrong(el);
+        else if (S.dimWrong) DOM.dimWrongOption(el);
       });
       LOG.success(`Highlighted ${correctEls.length} correct / ${allOptions.length} total`);
       return true;
@@ -599,16 +594,43 @@ const Engine = {
     return false;
   },
 
-  /** Process current question */
-  processQuestion(qId: string): boolean {
-    const cached = STATE.answers.get(qId);
-    if (!cached || cached.correctIndices.length === 0) {
-      LOG.warn(`No cached answer for ${qId}`);
-      return false;
+  /** Process current question — fetch answer if needed, then highlight */
+  async processQuestion(qId: string): Promise<boolean> {
+    const cached = S.answers.get(qId);
+
+    if (cached && cached.fetched && cached.correctIndices.length > 0) {
+      // Already have answer cached, just highlight
+      DOM.clearHighlights();
+      this.updatePanel(qId, cached);
+      const success = this.highlightAnswer(cached);
+      if (success) S.lastHighlightQId = qId;
+      return success;
     }
 
-    DOM.clearHighlights();
+    // Need to fetch answer via Proceed API
+    Panel.updateStatus("Mengambil jawaban...", "loading");
 
+    const result = await ProceedAPI.fetchAndProcess(qId);
+
+    if (result) {
+      DOM.clearHighlights();
+      this.updatePanel(qId, result);
+      const success = this.highlightAnswer(result);
+      if (success) S.lastHighlightQId = qId;
+
+      // Save to cache
+      if (S.roomHash) AnswerCache.save(S.roomHash);
+
+      Panel.updateStatus("Jawaban ditemukan!", "ok");
+      return success;
+    }
+
+    Panel.updateStatus("Gagal mengambil jawaban", "err");
+    return false;
+  },
+
+  /** Update panel with question and answer info */
+  updatePanel(qId: string, cached: CachedAnswer): void {
     const qText = stripHtml(Pinia.getText(qId));
     const type = Pinia.getType(qId);
 
@@ -616,47 +638,64 @@ const Engine = {
     if (cached.displayTexts.length > 0) answerDisplay = cached.displayTexts.join(" / ");
     else if (cached.imageUrls.length > 0) answerDisplay = `Opsi gambar ${cached.correctIndices.map(i => `#${i + 1}`).join(", ")}`;
     else if (cached.blankTexts.length > 0) answerDisplay = cached.blankTexts.join(" / ");
+    else if (cached.correctIndices.length > 0) answerDisplay = `Opsi ${cached.correctIndices.map(i => `#${i + 1}`).join(", ")}`;
 
     Panel.updateQuestion(qText, type);
     Panel.updateAnswer(answerDisplay);
-
-    const success = this.highlightAnswer(cached);
-    if (success) STATE.lastHighlightQId = qId;
-    return success;
   },
 
-  /** Main tick — called every 200ms */
-  tick(): void {
-    if (!STATE.inGame) return;
+  /** Main tick — called every 300ms */
+  async tick(): Promise<void> {
+    if (!Pinia.inGame) {
+      if (S.inGame) {
+        // Left the game
+        this.stop();
+      }
+      return;
+    }
 
-    // Capture any newly revealed answers
-    ProceedAPI.captureAllRevealed();
+    // Detect game start
+    if (!S.inGame) {
+      S.inGame = true;
+      S.roomHash = Pinia.roomHash;
+      S.roomCode = Pinia.roomCode;
+      S.playerId = Pinia.playerId;
+      S.quizVersionId = Pinia.quizVersionId;
+      S.totalQ = Pinia.totalQuestions;
+
+      LOG.always(`Game detected! Room: ${S.roomCode}, Questions: ${S.totalQ}`);
+
+      // Load cached answers
+      const cachedCount = AnswerCache.load(S.roomHash);
+      if (cachedCount > 0) {
+        LOG.success(`Loaded ${cachedCount} cached answers`);
+        Panel.updateStatus(`${cachedCount} jawaban dari cache`, "ok");
+      }
+
+      Panel.updateStats();
+    }
+
+    // Capture any newly revealed answers from Pinia
+    for (const qId of Pinia.questionIds) {
+      ProceedAPI.captureFromPinia(qId);
+    }
 
     const qId = Pinia.currentQId;
-    if (!qId || qId === STATE.currentQId) return;
+    if (!qId || qId === S.currentQId) return;
 
-    STATE.currentQId = qId;
-    STATE.answeredQ = Pinia.doneOrder.length;
-    STATE.retryCount = 0;
+    S.currentQId = qId;
+    LOG.info(`New question detected: ${qId}`);
 
-    LOG.info(`New question: ${qId}`);
-
-    const tryProcess = () => {
-      if (STATE.retryCount >= STATE.maxRetries) return;
-      const success = this.processQuestion(qId);
-      if (!success) {
-        STATE.retryCount++;
-        setTimeout(tryProcess, 500);
-      }
-    };
-
-    tryProcess();
+    // Process the new question
+    await this.processQuestion(qId);
     Panel.updateStats();
   },
 
   startPolling(): void {
-    if (STATE.pollTimer) clearInterval(STATE.pollTimer);
-    STATE.pollTimer = setInterval(() => this.tick(), 200);
+    if (S.pollTimer) clearInterval(S.pollTimer);
+    S.pollTimer = setInterval(() => this.tick(), 300);
+
+    // Also watch for DOM changes to re-apply highlights
     this.setupDOMWatcher();
   },
 
@@ -665,8 +704,9 @@ const Engine = {
     let reapplyCount = 0;
 
     const observer = new MutationObserver((mutations) => {
-      if (!STATE.lastHighlightQId || !Pinia.inGame) return;
-      const cached = STATE.answers.get(STATE.lastHighlightQId);
+      if (!S.lastHighlightQId || !Pinia.inGame) return;
+
+      const cached = S.answers.get(S.lastHighlightQId);
       if (cached && (cached.type === "BLANK" || cached.type === "OPEN")) return;
 
       const relevant = mutations.some((m) => {
@@ -680,9 +720,9 @@ const Engine = {
       if (!relevant) return;
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        if (!document.querySelector("[data-wg-correct]") && reapplyCount < 3) {
+        if (!document.querySelector("[data-wg-correct]") && reapplyCount < 5) {
           reapplyCount++;
-          STATE.lastHighlightQId = "";
+          S.lastHighlightQId = "";
           const qId = Pinia.currentQId;
           if (qId) this.processQuestion(qId);
         }
@@ -690,22 +730,20 @@ const Engine = {
     });
 
     const originalTick = this.tick.bind(this);
-    this.tick = () => { reapplyCount = 0; originalTick(); };
+    this.tick = async () => { reapplyCount = 0; await originalTick(); };
 
     observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class"] });
   },
 
   stop(): void {
-    if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+    if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer = null; }
     DOM.clearHighlights();
-    STATE.inGame = false;
-    STATE.answers.clear();
-    STATE.currentQId = "";
-    STATE.lastHighlightQId = "";
-    STATE.totalQ = 0;
-    STATE.answeredQ = 0;
-    STATE.correctQ = 0;
-    STATE.prefetched = false;
+    S.inGame = false;
+    S.answers.clear();
+    S.currentQId = "";
+    S.lastHighlightQId = "";
+    S.totalQ = 0;
+    S.initialized = false;
   },
 };
 
@@ -715,7 +753,8 @@ const Engine = {
 
 const Panel = {
   create(): void {
-    if (STATE.panel) return;
+    if (S.panel) return;
+
     const el = document.createElement("div");
     el.id = "wg-panel";
     el.classList.add("ghost");
@@ -797,24 +836,37 @@ const Panel = {
 
     document.head.appendChild(style);
     document.body.appendChild(el);
-    STATE.panel = el;
-    STATE.style = style;
+    S.panel = el;
+    S.style = style;
 
+    // Setup interactions
     this.setupDrag(el);
 
     el.querySelector("#wg-btn-minimize")!.addEventListener("click", () => el.classList.toggle("ghost"));
 
     el.querySelector("#wg-btn-reload")!.addEventListener("click", async () => {
-      STATE.prefetched = false;
-      STATE.fetchingInProgress = false;
-      await ProceedAPI.prefetchAllAnswers();
+      // Re-fetch answer for current question
+      S.fetchingQId = "";
       const qId = Pinia.currentQId;
-      if (qId) Engine.processQuestion(qId);
-      Panel.updateStatus(`${STATE.answers.size} jawaban dimuat`, "ok");
+      if (qId) {
+        // Remove cached answer and re-fetch
+        S.answers.delete(qId);
+        await Engine.processQuestion(qId);
+        Panel.updateStats();
+      }
     });
 
-    el.querySelector("#wg-dim")!.addEventListener("change", (e) => { STATE.dimWrong = (e.target as HTMLInputElement).checked; });
-    el.querySelector("#wg-debug")!.addEventListener("change", (e) => { STATE.debug = (e.target as HTMLInputElement).checked; });
+    el.querySelector("#wg-dim")!.addEventListener("change", (e) => {
+      S.dimWrong = (e.target as HTMLInputElement).checked;
+      // Re-highlight current question
+      if (S.lastHighlightQId) {
+        S.lastHighlightQId = "";
+        const qId = Pinia.currentQId;
+        if (qId) Engine.processQuestion(qId);
+      }
+    });
+
+    el.querySelector("#wg-debug")!.addEventListener("change", (e) => { S.debug = (e.target as HTMLInputElement).checked; });
   },
 
   setupDrag(el: HTMLElement): void {
@@ -824,48 +876,48 @@ const Panel = {
     header.addEventListener("mousedown", (e) => {
       const target = e.target as HTMLElement;
       if (target.tagName === "BUTTON" || target.tagName === "INPUT") return;
-      STATE.dragging = true;
+      S.dragging = true;
       sx = e.clientX; sy = e.clientY;
       const r = el.getBoundingClientRect();
       ix = r.left; iy = r.top;
       e.preventDefault();
     });
     document.addEventListener("mousemove", (e) => {
-      if (!STATE.dragging) return;
+      if (!S.dragging) return;
       el.style.left = `${ix + e.clientX - sx}px`;
       el.style.top = `${iy + e.clientY - sy}px`;
       el.style.right = "auto";
     });
-    document.addEventListener("mouseup", () => { STATE.dragging = false; });
+    document.addEventListener("mouseup", () => { S.dragging = false; });
   },
 
   updateStatus(text: string, type: "ok" | "err" | "loading" | "") {
-    const el = STATE.panel?.querySelector("#wg-status");
+    const el = S.panel?.querySelector("#wg-status");
     if (el) { el.className = type; const t = el.querySelector("#wg-status-text"); if (t) t.textContent = text; }
   },
 
   updateQuestion(text: string, type: string) {
-    const el = STATE.panel?.querySelector("#wg-question");
+    const el = S.panel?.querySelector("#wg-question");
     if (el) el.textContent = `${text.substring(0, 80)}${text.length > 80 ? "..." : ""} [${type}]`;
   },
 
   updateAnswer(text: string) {
-    const el = STATE.panel?.querySelector("#wg-answer");
+    const el = S.panel?.querySelector("#wg-answer");
     if (el) el.textContent = text;
   },
 
   updateStats() {
-    const el = STATE.panel?.querySelector("#wg-stats");
+    const el = S.panel?.querySelector("#wg-stats");
     if (el) {
       const done = Pinia.doneOrder.length;
-      const cached = STATE.answers.size;
-      el.innerHTML = `<span>${done}/${STATE.totalQ} dijawab</span><span>${cached} jawaban</span>`;
+      const cached = S.answers.size;
+      el.innerHTML = `<span>${done}/${S.totalQ} dijawab</span><span>${cached} jawaban</span>`;
     }
   },
 
   destroy(): void {
-    if (STATE.panel) { STATE.panel.remove(); STATE.panel = null; }
-    if (STATE.style) { STATE.style.remove(); STATE.style = null; }
+    if (S.panel) { S.panel.remove(); S.panel = null; }
+    if (S.style) { S.style.remove(); S.style = null; }
   },
 };
 
@@ -875,61 +927,81 @@ const Panel = {
 
 const Boot = {
   async start(): Promise<void> {
-    LOG.always("Starting CheatWG v2.0 (Join Code Mode)...");
+    LOG.always("Starting CheatWG v3.0 (Join Code Mode)...");
 
     Panel.create();
     Panel.updateStatus("Menunggu permainan...", "loading");
 
-    // Wait for game (up to 60s)
-    for (let i = 0; i < 60; i++) {
+    // Wait for game (up to 120s)
+    for (let i = 0; i < 120; i++) {
       if (Pinia.inGame) break;
       await new Promise(r => setTimeout(r, 1000));
-      Panel.updateStatus(`Menunggu permainan... (${i + 1}d)`, "loading");
+
+      // Update status every 5 seconds
+      if (i % 5 === 0) {
+        Panel.updateStatus(`Menunggu permainan...`, "loading");
+      }
     }
 
     if (!Pinia.inGame) {
       Panel.updateStatus("Permainan tidak ditemukan!", "err");
+      // Don't return - keep watching in case user joins later
+      this.keepWatching();
       return;
     }
 
-    // Get game info
-    STATE.roomHash = Pinia.roomHash || "";
-    STATE.roomCode = Pinia.roomCode || "";
-    STATE.playerId = Pinia.playerId || "";
-    STATE.quizVersionId = Pinia.quizVersionId || "";
-    STATE.inGame = true;
-    STATE.totalQ = Pinia.totalQuestions;
+    this.initialize();
+  },
 
-    LOG.success(`Game detected! Room: ${STATE.roomCode}, Hash: ${STATE.roomHash}, Questions: ${STATE.totalQ}`);
+  async initialize(): Promise<void> {
+    if (S.initialized) return;
+    S.initialized = true;
+
+    // Get game info
+    S.roomHash = Pinia.roomHash;
+    S.roomCode = Pinia.roomCode;
+    S.playerId = Pinia.playerId;
+    S.quizVersionId = Pinia.quizVersionId;
+    S.totalQ = Pinia.totalQuestions;
+    S.inGame = true;
+
+    LOG.success(`Game detected! Room: ${S.roomCode}, Hash: ${S.roomHash}, Questions: ${S.totalQ}`);
 
     // Try loading cached answers
-    const cachedCount = AnswerCache.load(STATE.roomHash);
+    const cachedCount = AnswerCache.load(S.roomHash);
     if (cachedCount > 0) {
       LOG.success(`Loaded ${cachedCount} cached answers`);
       Panel.updateStatus(`${cachedCount} jawaban dari cache`, "ok");
     }
 
-    // Pre-fetch ALL answers via Proceed API
-    if (!STATE.prefetched) {
-      const fetched = await ProceedAPI.prefetchAllAnswers();
-      Panel.updateStatus(`${fetched} jawaban berhasil diambil`, "ok");
-    }
-
-    if (STATE.roomHash) AnswerCache.save(STATE.roomHash);
     Panel.updateStats();
 
     // Start polling
     Engine.startPolling();
 
-    // Process current question
+    // Process current question if any
     const qId = Pinia.currentQId;
-    if (qId) { STATE.currentQId = qId; Engine.processQuestion(qId); }
+    if (qId) {
+      S.currentQId = qId;
+      await Engine.processQuestion(qId);
+    }
 
-    LOG.success("CheatWG v2.0 ready!");
+    LOG.success("CheatWG v3.0 ready!");
+    Panel.updateStatus("Aktif!", "ok");
+  },
+
+  /** Keep watching for game start even if initial wait timed out */
+  keepWatching(): void {
+    const watcher = setInterval(async () => {
+      if (Pinia.inGame) {
+        clearInterval(watcher);
+        await this.initialize();
+      }
+    }, 2000);
   },
 
   stop(): void {
-    if (STATE.roomHash) AnswerCache.save(STATE.roomHash);
+    if (S.roomHash) AnswerCache.save(S.roomHash);
     Engine.stop();
     Panel.destroy();
   },
@@ -943,12 +1015,19 @@ const Boot = {
   start: () => Boot.start(),
   stop: () => Boot.stop(),
   config: {
-    get dimWrong() { return STATE.dimWrong; }, set dimWrong(v) { STATE.dimWrong = v; },
-    get debug() { return STATE.debug; }, set debug(v) { STATE.debug = v; },
+    get dimWrong() { return S.dimWrong; }, set dimWrong(v) { S.dimWrong = v; },
+    get debug() { return S.debug; }, set debug(v) { S.debug = v; },
   },
-  cache: () => STATE.answers,
-  prefetch: () => ProceedAPI.prefetchAllAnswers(),
-  stats: () => ({ total: STATE.totalQ, answered: STATE.answeredQ, cached: STATE.answers.size, prefetched: STATE.prefetched }),
+  cache: () => S.answers,
+  stats: () => ({ total: S.totalQ, cached: S.answers.size, inGame: S.inGame, roomHash: S.roomHash, playerId: S.playerId }),
+  pinia: () => ({
+    roomHash: Pinia.roomHash,
+    roomCode: Pinia.roomCode,
+    playerId: Pinia.playerId,
+    currentQId: Pinia.currentQId,
+    inGame: Pinia.inGame,
+    totalQuestions: Pinia.totalQuestions,
+  }),
 };
 
 Boot.start();
