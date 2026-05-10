@@ -259,6 +259,7 @@ const ProceedAPI = {
   /**
    * Fetch correct answer for a single question via Proceed API.
    * Returns the correct answer index/indices from data.question.structure.answer.
+   * NOTE: Does NOT work for BLANK/OPEN types — use interceptor instead.
    */
   async fetchAnswer(questionId: string): Promise<number | number[] | null> {
     // Prevent duplicate fetches
@@ -266,6 +267,14 @@ const ProceedAPI = {
     S.fetchingQId = questionId;
 
     const qType = Pinia.getType(questionId);
+
+    // BLANK/OPEN types can't use Proceed API — skip
+    if (qType === "BLANK" || qType === "OPEN") {
+      LOG.info(`Skipping Proceed for ${qType} question ${questionId}`);
+      S.fetchingQId = "";
+      return null;
+    }
+
     const body = this.buildBody(questionId, qType);
 
     try {
@@ -383,17 +392,59 @@ const ProceedAPI = {
   async fetchAndProcess(questionId: string): Promise<CachedAnswer | null> {
     // Check if already cached
     const existing = S.answers.get(questionId);
-    if (existing && existing.fetched && existing.correctIndices.length > 0) return existing;
+    if (existing && existing.fetched && (existing.correctIndices.length > 0 || existing.blankTexts.length > 0)) return existing;
+
+    const qType = Pinia.getType(questionId);
+
+    // For BLANK/OPEN: build a pending cache entry from targets, wait for reveal
+    if (qType === "BLANK" || qType === "OPEN") {
+      const cached = this.buildBlankEntry(questionId);
+      if (cached) {
+        S.answers.set(questionId, cached);
+        return cached;
+      }
+      return null;
+    }
 
     const answer = await this.fetchAnswer(questionId);
     return this.processAnswer(questionId, answer);
   },
 
   /**
+   * Build a pending cache entry for BLANK/OPEN questions from targets data.
+   */
+  buildBlankEntry(questionId: string): CachedAnswer | null {
+    const q = Pinia.getQuestion(questionId);
+    if (!q) return null;
+
+    const cached: CachedAnswer = {
+      questionId,
+      type: q.type || "BLANK",
+      correctIndices: [],
+      displayTexts: [],
+      blankTexts: [],
+      imageUrls: [],
+      fetched: false,
+    };
+
+    // Extract answer length info from targets
+    const targets = q.targets || [];
+    targets.forEach((t: any) => {
+      if (t.settings?.answerLength) {
+        cached.blankTexts.push(`(${t.settings.answerLength} karakter)`);
+        cached.displayTexts.push(`Jawaban: ${t.settings.answerLength} karakter`);
+      }
+    });
+
+    return cached;
+  },
+
+  /**
    * Capture revealed answer from Pinia store (after user answers).
    */
   captureFromPinia(qId: string): void {
-    if (S.answers.has(qId) && S.answers.get(qId)!.fetched) return;
+    const existing = S.answers.get(qId);
+    if (existing && existing.fetched) return;
 
     const answerVal = Pinia.getAnswer(qId);
     const type = Pinia.getType(qId);
@@ -597,14 +648,28 @@ const Engine = {
   /** Process current question — fetch answer if needed, then highlight */
   async processQuestion(qId: string): Promise<boolean> {
     const cached = S.answers.get(qId);
+    const qType = Pinia.getType(qId);
 
-    if (cached && cached.fetched && cached.correctIndices.length > 0) {
-      // Already have answer cached, just highlight
+    // Already have answer cached with actual data
+    if (cached && cached.fetched && (cached.correctIndices.length > 0 || cached.blankTexts.length > 0)) {
       DOM.clearHighlights();
       this.updatePanel(qId, cached);
       const success = this.highlightAnswer(cached);
       if (success) S.lastHighlightQId = qId;
       return success;
+    }
+
+    // For BLANK/OPEN: show pending info while waiting for interceptor capture
+    if (qType === "BLANK" || qType === "OPEN") {
+      DOM.clearHighlights();
+      const pendingCached = cached || ProceedAPI.buildBlankEntry(qId);
+      if (pendingCached) {
+        S.answers.set(qId, pendingCached);
+        this.updatePanel(qId, pendingCached);
+        Panel.updateStatus("Menunggu jawaban terungkap...", "loading");
+        S.lastHighlightQId = qId;
+      }
+      return true; // Return true to prevent retry loop
     }
 
     // Need to fetch answer via Proceed API
@@ -925,9 +990,117 @@ const Panel = {
 //  BOOT
 // ═══════════════════════════════════════════
 
+// ═══════════════════════════════════════════
+//  FETCH INTERCEPTOR — Capture Proceed API responses
+// ═══════════════════════════════════════════
+
+const Interceptor = {
+  installed: false,
+
+  install(): void {
+    if (this.installed) return;
+    this.installed = true;
+
+    const originalFetch = window.fetch;
+    const self = this;
+
+    window.fetch = function(...args: Parameters<typeof fetch>): Promise<Response> {
+      const url = typeof args[0] === "string" ? args[0] : (args[0] as Request)?.url;
+
+      const result = originalFetch.apply(this, args);
+
+      // Only intercept Proceed API responses
+      if (url && url.includes("/proceed")) {
+        result.then(response => {
+          const clone = response.clone();
+          clone.json().then(data => {
+            self.handleProceedResponse(data);
+          }).catch(() => {});
+        }).catch(() => {});
+      }
+
+      return result;
+    };
+
+    LOG.info("Fetch interceptor installed");
+  },
+
+  handleProceedResponse(data: any): void {
+    if (!data?.success) return;
+
+    const questionId = data?.data?.response?.questionId;
+    const answer = data?.data?.question?.structure?.answer;
+
+    if (!questionId || answer === undefined || answer === null || answer === -1) return;
+
+    const qType = data?.data?.response?.questionType || Pinia.getType(questionId);
+
+    LOG.success(`Interceptor captured answer for ${questionId} (${qType}): ${JSON.stringify(answer)}`);
+
+    // Update cache
+    const existing = S.answers.get(questionId);
+
+    if (qType === "BLANK" || qType === "OPEN") {
+      // For BLANK: answer is typically array of {targetId, optionId[]}
+      const cached: CachedAnswer = existing || {
+        questionId, type: qType, correctIndices: [], displayTexts: [], blankTexts: [], imageUrls: [], fetched: false,
+      };
+
+      cached.fetched = true;
+
+      // Parse BLANK answer
+      if (Array.isArray(answer) && answer.length > 0 && typeof answer[0] === "object") {
+        const options = Pinia.getOptions(questionId);
+        const optMap = new Map<string, string>();
+        options.forEach((o: any) => {
+          if (o.id || o._id) optMap.set(o.id || o._id, stripHtml(o.text));
+        });
+        (answer as Array<{targetId: string; optionId: string[]}>).forEach((a) => {
+          a.optionId?.forEach((oid) => {
+            const txt = optMap.get(oid);
+            if (txt) { cached.blankTexts.push(txt); cached.displayTexts.push(txt); }
+          });
+        });
+      } else if (Array.isArray(answer)) {
+        answer.forEach((a: any) => {
+          if (typeof a === "string" && a) { cached.blankTexts.push(a); cached.displayTexts.push(a); }
+        });
+      }
+
+      if (cached.blankTexts.length === 0) {
+        cached.displayTexts = [JSON.stringify(answer)];
+        cached.blankTexts = cached.displayTexts;
+      }
+
+      S.answers.set(questionId, cached);
+
+      // Save cache
+      if (S.roomHash) AnswerCache.save(S.roomHash);
+
+      // Update panel if this is the current question
+      if (questionId === S.currentQId) {
+        Engine.updatePanel(questionId, cached);
+      }
+    } else if (qType === "MCQ" || qType === "MSQ" || qType === "IS" || qType === "ORDER") {
+      // For MCQ/MSQ: also cache the answer from interceptor (redundant but safe)
+      if (!existing || !existing.fetched) {
+        ProceedAPI.processAnswer(questionId, answer);
+        if (S.roomHash) AnswerCache.save(S.roomHash);
+      }
+    }
+  },
+};
+
+// ═══════════════════════════════════════════
+//  BOOT
+// ═══════════════════════════════════════════
+
 const Boot = {
   async start(): Promise<void> {
     LOG.always("Starting CheatWG v3.0 (Join Code Mode)...");
+
+    // Install fetch interceptor first
+    Interceptor.install();
 
     Panel.create();
     Panel.updateStatus("Menunggu permainan...", "loading");
